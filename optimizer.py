@@ -15,10 +15,12 @@ class Momentum:
     The weights are updated every iteration as well, meaning that the weight
     may be modified between updates without affecting previous estimates.
     """
+    rate: float
     rate_minus_1: float
     momentum: ArrayLike
     weights: float
     value: ArrayLike
+    last: ArrayLike
 
     def __init__(self: Momentum, *args: float, **kwargs: float) -> None:
         """
@@ -32,16 +34,21 @@ class Momentum:
         self.momentum = 0.0
         self.weights = 0.0
 
-    def __call__(self, value: ArrayLike) -> ArrayLike:
+    def __call__(self: Momentum, value: ArrayLike) -> ArrayLike:
         """
         Usage
         -----
         avg_value = momentum(value)  # update and return
         avg_value == momentum.value  # retrieve the value later
         """
+        self.last = value
         self.momentum += self.rate_minus_1 * (self.momentum - value)
         self.weights += self.rate_minus_1 * (self.weights - 1)
         return self.value
+
+    def clear(self: Momentum) -> None:
+        self.momentum = 0.0
+        self.weights = 0.0
 
     @property
     def rate(self: Momentum) -> float:
@@ -56,11 +63,66 @@ class Momentum:
         return self.momentum / self.weights
 
 
+class GeometricMomentum:
+    """
+    Similar to normal momentum but uses a logarithmic rescaling.
+    Requires inputs to be non-negative.
+    """
+    rate: float
+    rate_minus_1: float
+    eps: float
+    momentum: ArrayLike
+    weights: float
+    value: ArrayLike
+    last: ArrayLike
+
+    def __init__(self: Momentum, *args: float, eps: float = 1e-7, **kwargs: float) -> None:
+        """
+        Usage
+        -----
+        Momentum(0.9)
+        Momentum(rate=0.9)
+        Momentum(rate_minus_1=-0.1)
+        """
+        self.rate_minus_1 = args[0]-1 if args else kwargs.get("rate_minus_1", kwargs.get("rate", 0.999) - 1)
+        self.eps = eps
+        self.momentum = 0.0
+        self.weights = 0.0
+
+    def __call__(self: Momentum, value: ArrayLike) -> np.ndarray:
+        """
+        Usage
+        -----
+        avg_value = momentum(value)  # update and return
+        avg_value == momentum.value  # retrieve the value later
+        """
+        self.last = value
+        self.momentum += self.rate_minus_1 * (self.momentum - np.log(value + self.eps))
+        self.weights += self.rate_minus_1 * (self.weights - 1)
+        return self.value
+
+    def clear(self: Momentum) -> None:
+        self.momentum = 0.0
+        self.weights = 0.0
+
+    @property
+    def rate(self: Momentum) -> float:
+        return self.rate_minus_1 + 1
+
+    @rate.setter
+    def rate(self: Momentum, rate: float) -> None:
+        self.rate_minus_1 = rate - 1
+
+    @property
+    def value(self: Momentum) -> ArrayLike:
+        return np.exp(self.momentum / self.weights) - self.eps
+
+
 def random_array(
     low: ArrayLike = 0,
     high: ArrayLike = 1,
     size: Union[int, Sequence[int]] = (),
-    dtype: Union[Type[float], Type[float]] = float,
+    dtype: Union[Type[float], Type[int]] = float,
 ) -> np.ndarray:
     """
     Produces a random array of the specified shape within the provided bounds of the specific dtype.
@@ -101,15 +163,17 @@ def random_array(
 def optimize(
     func: Callable[[np.ndarray], float],
     x: ArrayLike,
-    iterations: Optional[int] = 1000,
-    abs_tol_x: float = 3e-1,
-    rel_tol_x: float = 3e-1,
-    abs_tol_f: float = 3e-1,
-    rel_tol_f: float = 3e-1,
-    refinement_iterations: int = 2500,
-    avg_rate: float = 3e-2,
+    trials: int = 3,
+    iterations: Optional[int] = 1500,
+    abs_tol_x: float = 3e-2,
+    abs_tol_f: float = 3e-2,
+    rel_tol_x: float = 1e-1,
+    rel_tol_f: float = 1e-1,
+    refinement_iterations: int = 300,
+    x_avg_rate: float = 1e-1,
+    f_avg_rate: float = 1e-1,
     minimize: bool = True,
-    dtype: Union[Type[float], Type[float]] = float,
+    dtype: Union[Type[float], Type[int]] = float,
     perturbation: float = 0.5,
     pr_decay_rate: float = 0.01,
     pr_decay_power: float = 0.16,
@@ -118,7 +182,7 @@ def optimize(
     lr_decay_power: float = 0.606,
     momentum_rate: float = 0.99,
     norm_momentum_rate: float = 0.999,
-    norm_order: Optional[float] = np.inf,
+    norm_order: Optional[float] = 2,
     check_inputs: bool = True,
     return_var: Sequence[str] = 'x',
 ) -> Any:
@@ -133,6 +197,13 @@ def optimize(
 
     SPSA Features
     -------------
+    Objective-Free
+        The objective function doesn't necessarily have to exist.
+        What we actually need is for every pair of function calls to
+        provide a change in output so that the algorithm knows which
+        direction to move in. This means applications can include objectives
+        such as chess AI, since we can measure the change based on the winner
+        of a game. See Parameters.Required.func for more details.
     Derivative-Free
         No gradient is required. Only function calls are used.
         The function need not be differentiable either for this to be used.
@@ -191,7 +262,6 @@ def optimize(
     Early Termination and Refinement
         It is usually unknown when you should terminate beforehand,
         even moreso in a stochastic setting where iterations may be noisy.
-        
         See Parameters.Termination for more information.
 
     ==========
@@ -202,31 +272,43 @@ def optimize(
     --------
     func(np.ndarray[dtype]) -> float
         The function being optimized. It must be able to take in numpy arrays and return floats.
+        The input is rounded if dtype=int.
         The output is either minimized or maximized depending on the `minimize` arg.
+        It is guaranteed exactly two func evaluations occur every iteration.
+        In some contexts, such as two-player AIs, it may be required that both func evaluations occur together.
+        If this is the case, we suggest returning 0 for the first evaluation and then basing the second evaluation from that.
     x : ArrayLike[dtype]
         The initial estimate used. See `optimizer.random_array` to create random arrays.
 
     Termination
     -----------
+    trials : int = 3
+        The amount of times we restart the algorithm with a third of the learning rate and
+        perturbation size. Restarting has similar affects to learning rate schedules.
+        It may appear that when starting another trial, the objective rapidly decreases.
+        This phenomenon occurs due to dropping initial object function evaluations by reseting the average.
+        We recommend this as a counter measure to terminating too early without terminating too late.
     iterations
-        : int = 1000, default
+        : int = 1500, default
             The maximum amount of iterations ran before termination.
         : None
             The number of iterations ran is not considered for termination.
-    abs_tol_x, rel_tol_x : float = 3e-1
-    abs_tol_f, rel_tol_f : float = 3e-1
-        The minimum default tolerance before termination.
+    abs_tol_x, abs_tol_f : float = 3e-2
+    rel_tol_x, rel_tol_f : float = 1e-1
+        The minimum default tolerance before refinement is triggered.
+        Tolerance is measured by comparing an averaged value against an even slower average.
+        In other words, the variable must remain the same a while for both averages to coincide.
+        Additionally, the f tolerance checks if the func(x) has the slower average decreasing sufficiently fast.
         The x tolerance is rescaled by the learning rate.
-        The relative tolerance in f is measured against a lagged average change in f.
-        In other words, rel_tol_f is triggered when f starts to decrease slower.
         Set to 0 to disable.
-    avg_rate : float = 3e-2
-        The rate used for the averages. The smaller, the more averaged out it'll be.
+    x_avg_rate : float = 1e-1
+    f_avg_rate : float = 1e-1
+        The rate used for the averages.
+        The smaller, the more averaged out it'll be, but the slower it can react to changes.
         Every iteration it is gradually reduced to increase smoothness.
-    refinement_iterations : int = 2500
-        Run the specified number of iterations after termination.
-        Note: Counts the number of iterations, x tolerance, and f tolerance separately.
-              While all 3 reach their conditions, only a third of the remaining refinement iterations are used.
+    refinement_iterations : int = 300
+        The number of times refinement must be triggered for the trial to terminate.
+        Counts iterations, x tolerance, and f tolerance separately.
         Additionally applies a third of the lr/pr decay power, where the refinement_i is used for the iterations.
             learning_rate /= (1 + lr_decay_rate * refinement_i) ** (lr_decay_power / 3)
             px /= (1 + pr_decay_rate * refinement_i) ** (pr_decay_power / 3)
@@ -234,10 +316,10 @@ def optimize(
     Problem Specification
     ---------------------
     minimize : bool = True
-        If True, `func(x)` is minimized. Otherwise `func(x)` is maximized.
+        If True, func(x) is minimized. Otherwise func(x) is maximized.
     dtype : type
         = float, default
-            `x` is cast to floats and the perturbation may be used.
+            x is cast to floats and the perturbation may be used.
             Hyper-parameter optimization is not usable.
         = int
             `x` is cast to integers and the perturbation is fixed to 0.5.
@@ -262,7 +344,7 @@ def optimize(
         where `i` is the current iteration.
         This gradually improves the accuracy of the gradient estimation
         but not so fast that the noise takes over.
-        Set pr_decay_...=0 to disable.
+        Set either to 0 to disable.
         Changes to 0 if dtype=int is used.
     learning_rate : Optional[float] = (0.1 if dtype is int else 1e-3)
         The amount that x is changed each iteration.
@@ -274,7 +356,7 @@ def optimize(
         This gradually improves the accuracy for stochastic functions
         and ensures eventual convergence even if the learning_rate is initially too large
         but doesn't decay so fast that it converges before the solution is found.
-        Set lr_decay_offset=0 to disable.
+        Set either to 0 to disable.
     momentum_rate : float = 0.99
         The amount of momentum retained each iteration.
         Use 0 to disable.
@@ -282,7 +364,7 @@ def optimize(
         The amount of the magnitude of the momentum retained each iteration.
         Use 0 to disable.
     norm_order
-        : float = inf, default
+        : float = 2, default
             The order used for the L^p norm when normalizing the momentum to compute step sizes.
         : None
             Don't normalize the momentum when computing step sizes.
@@ -294,23 +376,16 @@ def optimize(
         If False, only necessary setup is done.
     return_var
         : str = 'x', default
-            The name of the var returned.
-            'gradient' provides the gradient estimate.
-            'gradient_copy' provides a copy of the gradient estimate.
-            'x_copy' provides 'x' as a copy.
-            'x_float' provides 'x' without rounding.
-                Note that when dtype=int, x=round_array(x_float).
-            'x_float_copy' provides 'x_float' as a copy.
-            'func(x)' provides the last computed func(x).
-                Note that x is always perturbed during function calls,
-                so this may not accurately represent func(x).
-            'df(x)' provides the average change in func(x).
-            'avg_...' provides an averaged estimate of the specified '...' variable, including:
-                func(x)
-                df(x)  (change in func(x))
-                x  (not rounded)
-                dx  (difference between x and avg_x)
-            Any other parameters can be tracked.
+            The name of the var returned, including below and any of the parameters.
+            i : the current iteration within the trial.
+            j : the current total iteration.
+            gradient : the gradient estimate.
+            x : rounded appropriately.
+            x_copy : a copy of x.
+            x_float : not rounded.
+            x_float_copy : not rounded and copied.
+            func(x) : last estimate of func(x). Note that x is perturbed, so this may be inaccurate.
+            avg_... : an average of the specified variable, including mainly x and func(x).
         : Sequence[str]
             Returns a list of vars e.g. ['x', 'func(x)'].
 
@@ -324,15 +399,17 @@ def optimize(
 def iter_optimize(
     func: Callable[[np.ndarray], float],
     x: ArrayLike,
-    iterations: Optional[int] = 1000,
-    abs_tol_x: float = 3e-1,
-    rel_tol_x: float = 3e-1,
-    abs_tol_f: float = 3e-1,
-    rel_tol_f: float = 3e-1,
-    refinement_iterations: int = 2500,
-    avg_rate: float = 3e-2,
+    trials: int = 3,
+    iterations: Optional[int] = 1500,
+    abs_tol_x: float = 3e-2,
+    abs_tol_f: float = 3e-2,
+    rel_tol_x: float = 1e-1,
+    rel_tol_f: float = 1e-1,
+    refinement_iterations: int = 300,
+    x_avg_rate: float = 1e-1,
+    f_avg_rate: float = 1e-1,
     minimize: bool = True,
-    dtype: Union[Type[float], Type[float]] = float,
+    dtype: Union[Type[float], Type[int]] = float,
     perturbation: float = 0.5,
     pr_decay_rate: float = 0.01,
     pr_decay_power: float = 0.16,
@@ -341,7 +418,7 @@ def iter_optimize(
     lr_decay_power: float = 0.606,
     momentum_rate: float = 0.99,
     norm_momentum_rate: float = 0.999,
-    norm_order: Optional[float] = np.inf,
+    norm_order: Optional[float] = 2,
     check_inputs: bool = True,
     return_var: Sequence[str] = 'x',
 ) -> Iterator[Any]:
@@ -362,11 +439,9 @@ def iter_optimize(
         elif key == "x":
             return round_array(x) if dtype is int else x
         elif key == "func(x)":
-            return output
+            return output if minimize else -output
         elif key == "avg_func(x)":
-            return avg_output.value
-        elif key == "avg_df(x)":
-            return avg_df.value
+            return avg_f.value if minimize else -avg_f.value
         elif key.startswith("avg_"):
             return loc_vars[key].value
         else:
@@ -394,6 +469,10 @@ def iter_optimize(
         rel_tol_f = float(rel_tol_f)
         if not all(tol >= 0 for tol in (abs_tol_x, abs_tol_f, rel_tol_x, rel_tol_f)):
             raise ValueError("tolerance requires tolerance >= 0")
+        x_avg_rate = float(x_avg_rate)
+        f_avg_rate = float(f_avg_rate)
+        if not all(0 < rate < 1 for rate in (x_avg_rate, f_avg_rate)):
+            raise ValueError("avg_rate requires 0 < avg_rate < 1")
         perturbation = float(perturbation)
         pr_decay_rate = float(pr_decay_rate)
         pr_decay_power = float(pr_decay_power)
@@ -408,39 +487,15 @@ def iter_optimize(
         if norm_order is not None:
             norm_order = float(norm_order)
     # Additional variables:
-    # Define round_func to encapsulate func with the appropriate rounding.
-    if dtype is float:
-        round_func = func
+    # Define f to encapsulate func with the appropriate rounding and sign.
+    if dtype is float and minimize:
+        f = func
+    elif minimize:
+        f = lambda x: func(round_array(x))
+    elif dtype is float:
+        f = lambda x: -func(x)
     else:
-        round_func = lambda x: func(round_array(x))
-    # Track the number of iterations passed with termination.
-    refinement_i = 0
-    # Track the averages of several variables.
-    tol_avgs = [Momentum(rate_minus_1=-avg_rate) for _ in range(4)]
-    avg_x, avg_dx, avg_output, avg_df = tol_avgs
-    slow_df = Momentum(rate_minus_1=-0.03)
-    avg_gradient = Momentum(momentum_rate)
-    gradient = np.zeros_like(x)
-    avg_gradient_norm = Momentum(norm_momentum_rate)
-    # Avoid division by 0.
-    avg_gradient_norm(1e-7)
-    # Track the last output.
-    output = None
-    # Define f to track the output and change to the appropriate sign.
-    def f(x):
-        nonlocal output
-        # Track the last output.
-        output = round_func(x)
-        # Track the average output and change in output.
-        avg_output(output)
-        slow_df(avg_df(np.linalg.norm(avg_output.value - output)))
-        # Correct the sign for the optimizer.
-        return output if minimize else -output
-    # Initialize average outputs.
-    f(x)
-    f(x)
-    # Initial Nesterov step size is 0.
-    dx = 0
+        f = lambda x: -func(round_array(x))
     # Start from the given learning rate and decrease down to 0.
     # Then restart again from a slighly lower learning rate, but decrease slightly more.
     # Allows iterations to make big jumps and then refine the estimates.
@@ -448,51 +503,88 @@ def iter_optimize(
         for i in count():
             max_lr = learning_rate / (1 + lr_decay_rate * i**1.5) ** lr_decay_power
             yield from max_lr / np.sqrt(np.arange(1, 11+5*np.math.isqrt(i)))
-    # Iterate over the given learning rate.
-    for i, learning_rate in enumerate(restarting_decaying_learning_rate(learning_rate), 1):
-        # Check if the number of iterations has been reached.
-        if iterations is not None and i > iterations:
-            refinement_i += 1
-        # Stop if we're done refining the solution.
-        if refinement_i >= refinement_iterations:
-            break
-        # Gradually make the averages more smooth.
-        for avg in tol_avgs:
-            avg.rate_minus_1 /= (1 + 1 / i) ** 0.4
-        # Use a lower learning rate while refining estimates.
-        learning_rate /= (1 + lr_decay_rate * refinement_i) ** (lr_decay_power / 3)
-        # Generate a result.
+    j = 0
+    lr = learning_rate
+    lr *= 3
+    for trial in range(1, trials + 1):
+        lr /= 3
+        if dtype is float:
+            perturbation /= 3
+        # Track the number of iterations passed with termination.
+        refinement_i = 0
+        # Track the averages of several variables.
+        avg_x = Momentum(rate_minus_1=-x_avg_rate)
+        avg_x_slow = Momentum(rate_minus_1=-x_avg_rate/3)
+        avg_dx = GeometricMomentum(rate_minus_1=-x_avg_rate/10)
+        avg_f = Momentum(rate_minus_1=-f_avg_rate)
+        avg_f_slow = Momentum(rate_minus_1=-f_avg_rate/3)
+        avg_df = GeometricMomentum(rate_minus_1=-f_avg_rate/10)
+        tol_avgs = [avg_x, avg_x_slow, avg_dx, avg_f, avg_f_slow, avg_df]
+        avg_gradient = Momentum(momentum_rate)
+        avg_gradient_norm = Momentum(norm_momentum_rate)
+        avg_gradient_norm(1e-7)
+        # Initial Nesterov step size is 0.
+        dx = 0
+        # Iterate over the given learning rate.
+        for i, learning_rate in enumerate(restarting_decaying_learning_rate(lr), 1):
+            j += 1
+            # Gradually make the averages more smooth.
+            for avg in tol_avgs:
+                avg.rate_minus_1 /= (1 + 1 / i) ** 0.3
+            # Use a lower learning rate while refining estimates.
+            learning_rate /= (1 + lr_decay_rate * refinement_i) ** (lr_decay_power / 3)
+            # Decay the perturbation size to gradually improve accuracy.
+            px = np.random.choice([-perturbation, perturbation], x.shape)
+            px /= (1 + pr_decay_rate * i) ** pr_decay_power * (1 + pr_decay_rate * refinement_i) ** (pr_decay_power / 3)
+            # Compute perturbations.
+            f_plus = f(x + dx + px)
+            f_minus = f(x + dx - px)
+            # Track the last output.
+            output = (f_plus + f_minus) / 2
+            # Estimate gradient: df/dx, where dx is the perturbation.
+            df = (f_plus - f_minus) / 2
+            df_dx = df / px
+            gradient = avg_gradient(df_dx)
+            # Compute step size with decaying learning rate to gradually converge.
+            dx = -learning_rate
+            # Normalize the step size.
+            if norm_order is not None:
+                dx /= np.sqrt(avg_gradient_norm(np.linalg.norm(gradient, norm_order)**2))
+            dx *= gradient
+            x += dx
+            # Check tolerances by seeing if the average and slower averages are very close to each other.
+            avg_dx(np.linalg.norm(avg_x(x) - avg_x_slow(x)))
+            if avg_dx.last < learning_rate * (abs_tol_x + rel_tol_x * avg_dx.value):
+                refinement_i += 1
+            avg_df(abs(avg_f(output) - avg_f_slow(output)))
+            if avg_df.last < abs_tol_f + rel_tol_f * avg_df.value:
+                refinement_i += 1
+            # Check if we're actually decreasing.
+            if avg_f_slow.value - output < abs_tol_f + rel_tol_f * avg_f_slow.value:
+                refinement_i += 1
+            # Check if the number of iterations has been reached.
+            if iterations is not None and i > iterations:
+                refinement_i += 1
+            # Stop if we're done refining the solution.
+            if refinement_i >= refinement_iterations:
+                break
+            # Generate a result.
+            yield get_var(locals())
+        # Use the average solutions to reduce noise and oscillation.
+        x = avg_x.value
+        output = avg_f.value
         yield get_var(locals())
-        # Compute perturbations.
-        # Decay the perturbation size to gradually improve accuracy.
-        px = np.random.choice([-perturbation, perturbation], x.shape)
-        px /= (1 + pr_decay_rate * i) ** pr_decay_power * (1 + pr_decay_rate * refinement_i) ** (pr_decay_power / 3)
-        f_plus = f(x + dx + px)
-        f_minus = f(x + dx - px)
-        # Estimate gradient: df/dx, where dx is the perturbation.
-        df = (f_plus - f_minus) / 2
-        gradient = avg_gradient(df / px)
-        # Compute step size with decaying learning rate to gradually converge.
-        dx = -learning_rate
-        # Normalize the step size.
-        if norm_order is not None:
-            dx /= np.sqrt(avg_gradient_norm(np.linalg.norm(gradient, norm_order)**2))
-        dx *= gradient
-        x += dx
-        # Check tolerances by using and updating the averages.
-        if avg_dx(np.linalg.norm(dx)) < learning_rate * (abs_tol_x + rel_tol_x * np.linalg.norm(avg_x(x))):
-            refinement_i += 1
-        if avg_df.value < abs_tol_f + rel_tol_f * abs(slow_df.value):
-            refinement_i += 1
-    # Use the average solutions to reduce noise and oscillation.
-    x = avg_x.value
-    output = avg_output.value
-    yield get_var(locals())
 
 
 def round_array(x: ArrayLike) -> np.ndarray:
     """Rounds an ArrayLike to np.ndarray[int]."""
     return np.rint(x).astype(int)
+
+
+def normalize(x: ArrayLike, order: float = 2, eps: float = 1e-7) -> np.ndarray:
+    """Normalized an ArrayLike to np.ndarray[float]."""
+    x = np.array(x, copy=False, dtype=float)
+    return x / (np.linalg.norm(x) + eps)
 
 
 T = TypeVar('T')
