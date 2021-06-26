@@ -169,6 +169,7 @@ def optimize(
     abs_tol_f: float = 3e-2,
     rel_tol_x: float = 1e-1,
     rel_tol_f: float = 1e-1,
+    check_decreasing: bool = True,
     refinement_iterations: int = 300,
     x_avg_rate: float = 1e-1,
     f_avg_rate: float = 1e-1,
@@ -187,7 +188,14 @@ def optimize(
     return_var: Sequence[str] = 'x',
 ) -> Any:
     """
-    Optimize a function i.e. find a local minima or maxima.
+    Find a local optima of `func` using only function evaluations.
+
+    Requires detectable differences between func(x+px) and func(x-px) for small px
+    in order to determine if it should move towards x+px and x-px.
+
+    ========
+    Features
+    ========
 
     The algorithm used is based on the
         Simultaneous Perturbation Stochastic Approximation (SPSA).
@@ -290,17 +298,19 @@ def optimize(
         We recommend this as a counter measure to terminating too early without terminating too late.
     iterations
         : int = 1500, default
-            The maximum amount of iterations ran before termination.
+            The maximum amount of iterations ran before refinement is triggered.
         : None
-            The number of iterations ran is not considered for termination.
+            The number of iterations ran is not considered.
     abs_tol_x, abs_tol_f : float = 3e-2
     rel_tol_x, rel_tol_f : float = 1e-1
         The minimum default tolerance before refinement is triggered.
         Tolerance is measured by comparing an averaged value against an even slower average.
         In other words, the variable must remain the same a while for both averages to coincide.
-        Additionally, the f tolerance checks if the func(x) has the slower average decreasing sufficiently fast.
+        Additionally, f_tol determines how fast the slow average func(x) must decrease if check_decreasing is set.
         The x tolerance is rescaled by the learning rate.
         Set to 0 to disable.
+    check_decreasing : bool = True
+        If set to True, then func(x) will be compared against the slower average func(x) using tol_f.
     x_avg_rate : float = 1e-1
     f_avg_rate : float = 1e-1
         The rate used for the averages.
@@ -405,6 +415,7 @@ def iter_optimize(
     abs_tol_f: float = 3e-2,
     rel_tol_x: float = 1e-1,
     rel_tol_f: float = 1e-1,
+    check_decreasing: bool = True,
     refinement_iterations: int = 300,
     x_avg_rate: float = 1e-1,
     f_avg_rate: float = 1e-1,
@@ -560,7 +571,7 @@ def iter_optimize(
             if avg_df.last < abs_tol_f + rel_tol_f * avg_df.value:
                 refinement_i += 1
             # Check if we're actually decreasing.
-            if avg_f_slow.value - output < abs_tol_f + rel_tol_f * avg_f_slow.value:
+            if check_decreasing and avg_f_slow.value - output < abs_tol_f + rel_tol_f * avg_f_slow.value:
                 refinement_i += 1
             # Check if the number of iterations has been reached.
             if iterations is not None and i > iterations:
